@@ -9,6 +9,8 @@
 //config:   bool "apt (8 kb)"
 //config:   default y
 //config:   select DPKG
+//config:   select AR
+//config:   select TAR
 //config:   help
 //config:   apt is a high-level package management frontend. It handles
 //config:   repository management and dependency resolution as a
@@ -25,18 +27,22 @@
 //usage:#define apt_full_usage "\n\n"
 //usage:       "High-level package management frontend\n"
 //usage:     "\nOptions:"
-//usage:     "\n    -f, --fix-broken   Pass --force-depends to dpkg"
+//usage:     "\n    -f, --fix-broken		Pass --force-depends to dpkg"
 //usage:     "\nCommands:"
-//usage:     "\n    update    Update list of available packages"
-//usage:     "\n    install       Install new packages"
-//usage:     "\n    remove    Remove packages"
-//usage:     "\n    upgrade       Upgrade the system"
-//usage:     "\n    reinstall  Reinstall packages (restores files)"
-//usage:     "\n    rescue-install Install packages bypassing dpkg (uses internal ar/tar to /)"
-//usage:     "\n    verify    Verify package sanity (deps, files & symlinks)"
-//usage:     "\n    md5check   Verify package integrity (checks md5sums)"
-//usage:     "\n    list --upgradable  Show packages with available updates"
-//usage:     "\n    search    Search for a package"
+//usage:     "\n    update		Update list of available packages"
+//usage:     "\n    install		install new packages"
+//usage:     "\n    remove		Remove packages"
+//usage:     "\n    purge		Remove packages with all files include configs"
+//usage:     "\n    upgrade		Upgrade the system"
+//usage:     "\n    reinstall		Reinstall packages (restores files)"
+//usage:     "\n    verify		Verify package sanity (deps, files & symlinks)"
+//usage:     "\n    md5check		Verify package integrity (checks md5sums)"
+//usage:     "\n    list		Show installed packages"
+//usage:     "\n    list -u		Show packages with available updates only"
+//usage:     "\n    search		Search for a package"
+//usage:     "\n    clean		Clean cache for installed packages in /var/cache/apt/archives/"
+//usage:     "\nFix Commands:"
+//usage:     "\n    rescue-install	Install packages bypassing dpkg (extract package to / uses ar and tar)"
 
 #include "libbb.h"
 #include "bb_archive.h"
@@ -60,6 +66,7 @@ typedef struct repo_s {
     llist_t *components;
     struct repo_s *next;
 } repo_t;
+
 
 typedef struct pkg_s {
     char *name;
@@ -87,6 +94,9 @@ struct globals {
 } FIX_ALIASING;
 #define G (*(struct globals*)bb_common_bufsiz1)
 
+static char *arch = NULL;
+static repo_t *repos = NULL;
+
 static void get_bb_exe(char *buf, size_t size)
 {
     ssize_t len = readlink("/proc/self/exe", buf, size - 1);
@@ -101,7 +111,7 @@ static int run_cmd(char *const argv[])
     int status;
 
     pid = vfork();
-    if (pid < 0) return -1;
+    if (pid < 0) return -127;
     if (pid == 0) {
         /* Child */
         /* Redirect stderr to /dev/null for quietness if desired, though omitted here for standard BB behavior */
@@ -111,7 +121,7 @@ static int run_cmd(char *const argv[])
     
     waitpid(pid, &status, 0);
     if (WIFEXITED(status)) return WEXITSTATUS(status);
-    return -1;
+    return -127;
 }
 
 static int download_file(const char *url, const char *dest)
@@ -122,12 +132,13 @@ static int download_file(const char *url, const char *dest)
 
     /* 1. Try system wget */
     rc = run_cmd(argv_sys);
-    if (rc == 0) return 0;
+    if (rc != 127) return rc; //one try if wget exist on path
 
     /* 2. Fallback using our exact binary path */
     rc = run_cmd(argv_bb);
     if (rc != 0) {
-       bb_error_msg("Both system and internal wget failed to download %s", url);
+       bb_error_msg("Both system and internal wget failed to download:");
+	   bb_error_msg("%s", url);
     }
     return rc;
 }
@@ -140,7 +151,7 @@ static int dpkg_call(char **argv_ext)
     /* Modify argv_ext[0] inline to point to correct binary */
     argv_ext[0] = (char*)"dpkg";
     rc = run_cmd(argv_ext);
-    if (rc == 0) return 0;
+    if (rc != 127) return rc;//127 binary not exist on path, try internal dpkg
 
     /* Fallback to internal dpkg */
     /* Shift array right requires realloc in caller, so we build a new one */
@@ -163,27 +174,25 @@ static int md5_check(const char *md5, const char *path)
 {
     int rc, fd;
     char tmp_file[] = "/tmp/md5.XXXXXX";
-    char *argv_sys[6];
-    char *argv_bb[7];
+    char *argv_sys[4];
+    char *argv_bb[5];
 
     fd = mkstemp(tmp_file);
     if (fd < 0) return -1;
 
     dprintf(fd, "%s  %s\n", md5, path);
     close(fd);
-
+	//--status show usage in busybox based system.
     argv_sys[0] = (char*)"md5sum";
     argv_sys[1] = (char*)"-c";
-    argv_sys[2] = (char*)"--status";
-    argv_sys[3] = tmp_file;
-    argv_sys[4] = NULL;
+    argv_sys[2] = tmp_file;
+    argv_sys[3] = NULL;
 
     argv_bb[0] = G.bb_path;
     argv_bb[1] = (char*)"md5sum";
     argv_bb[2] = (char*)"-c";
-    argv_bb[3] = (char*)"--status";
-    argv_bb[4] = tmp_file;
-    argv_bb[5] = NULL;
+    argv_bb[3] = tmp_file;
+    argv_bb[4] = NULL;
 
     rc = run_cmd(argv_sys);
     if (rc != 0) rc = run_cmd(argv_bb);
@@ -200,12 +209,10 @@ static void update_progress(int current, int total, const char *msg UNUSED_PARAM
 
     get_terminal_width_height(STDOUT_FILENO, &width, &height);
     if (width < 30) return;
-
     percent = (current * 100) / total;
     bar_space = width - 24;
     if (bar_space < 10) bar_space = 10;
     pos = (percent * bar_space) / 100;
-
     printf("\033[%d;1H\033[K", height);
     printf("Progress: [%3d%%] [", percent);
     for (i = 0; i < bar_space; i++) {
@@ -226,50 +233,84 @@ static int llist_count(llist_t *list)
     return count;
 }
 
+static char *get_debian_arch(void)
+{
+    struct utsname uts;
+    if (uname(&uts) < 0) return NULL;
+    if (strcmp(uts.machine, "x86_64") == 0) return (char *)"amd64";
+	if (strstr(uts.machine, "86")) return (char *)"i386";
+    if (strcmp(uts.machine, "aarch64") == 0) return (char *)"arm64";
+	//if ((strncmp(uts.machine, "armv4", 5) == 0) ||
+    //    (strncmp(uts.machine, "armv5", 5) == 0)) return "armel";
+	// if (strncmp(uts.machine, "arm", 3) == 0) return "armhf"; //there more names in arch arm..
+    return NULL; // mips,mipsel armel,armhf,armeb and other arch take user manualy enter name of arch used by repo to sources.list {deb [arch=xx]}
+}
+
 static repo_t *parse_sources_list(const char *filename)
 {
     FILE *f = fopen_for_read(filename);
-    repo_t *repos = NULL;
-    char *line;
-
+    repo_t *init_repos = NULL;
+    char *line , *ptr;
+	char *type, *uri, *dist;
+	
     if (!f) return NULL;
-
     while ((line = xmalloc_fgetline(f)) != NULL) {
-       char *ptr = skip_whitespace(line);
-       char *type, *uri, *dist;
-
-       if (*ptr == '#' || *ptr == '\0') {
+       line = skip_whitespace(line);
+       
+	   
+       if (*line == '#' || *line == '\0') {
           free(line);
           continue;
        }
-
-       type = strtok(ptr, " \t");
+       type = strtok(line, " \t");
        if (!type || strcmp(type, "deb") != 0) {
           free(line);
           continue;
        }
-
-       uri = strtok(NULL, " \t");
+       //check if arch in line
+	   ptr = strtok(NULL, " \t");
+	   if(strncmp(ptr ,"[arch=",6) == 0) {
+		   if (arch == NULL) { //one shot
+			   ptr = ptr + 6; //skip [arch= 
+			   if (strchr(ptr,',') != NULL) //multi arch [arch=amd64,i386] take first one and ignore other..
+				   arch = xstrndup(ptr,(strchr (ptr, ',')-ptr));
+			   else if (strchr(ptr,']') != NULL) //single arch
+				   arch = xstrndup(ptr, (strchr (ptr, ']')-ptr));
+		   }
+		   uri = strtok(NULL, " \t");
+	   }else
+		   uri = ptr;
+	   
        dist = strtok(NULL, " \t");
 
        if (uri && dist) {
           repo_t *new_repo = xzalloc(sizeof(repo_t));
-          char *comp;
-
-          new_repo->uri = xstrdup(uri);
+          char *comp;		  		  
+		  size_t last_char = strlen(uri)-1; //check last char in uri to remove / if exist
+		  if (uri[last_char] == '/')
+			  new_repo->uri = xstrndup(uri,last_char);
+		  else
+          	  new_repo->uri = xstrdup(uri);
+		  
           new_repo->dist = xstrdup(dist);
 
           while ((comp = strtok(NULL, " \t")) != NULL) {
              llist_add_to(&new_repo->components, xstrdup(comp));
           }
-
-          new_repo->next = repos;
-          repos = new_repo;
+          new_repo->next = init_repos;
+          init_repos = new_repo;
+		  free(comp);
        }
+	   ptr = NULL;
+	   type = NULL;
+	   uri = NULL;
+	   dist = NULL;
        free(line);
     }
     fclose(f);
-    return repos;
+	if (arch == NULL)
+		arch = get_debian_arch();
+    return init_repos;
 }
 
 static char *uri_to_filename(const char *uri)
@@ -283,7 +324,7 @@ static char *uri_to_filename(const char *uri)
 
     s = p;
     while (*s) {
-       if (*s == '/' || *s == ':') *s = '_';
+       if (*s == '/' || *s == ':') *s = '_'; 
        s++;
     }
     ret = xstrdup(p);
@@ -291,26 +332,16 @@ static char *uri_to_filename(const char *uri)
     return ret;
 }
 
-static const char *get_debian_arch(void)
-{
-    struct utsname uts;
-    if (uname(&uts) < 0) return "amd64";
-    if (strcmp(uts.machine, "x86_64") == 0) return "amd64";
-    if (strcmp(uts.machine, "aarch64") == 0) return "arm64";
-    if (strncmp(uts.machine, "arm", 3) == 0) return "armhf";
-    if (strstr(uts.machine, "86")) return "i386";
-    return "amd64";
-}
 
-static void update_repos(repo_t *repos)
+static void update_repos(void)
 {
     repo_t *curr = repos;
-    const char *arch = get_debian_arch();
     int count = 1;
 
-    mkdir("/var/lib/apt", 0755);
-    mkdir("/var/lib/apt/lists", 0755);
-
+	if (arch == NULL) {
+		bb_error_msg("could not find arch name to your hardware , please add arch name accepted by repo");
+		bb_error_msg_and_die("add arch after deb word in /etc/apt/sources.list , this example for arch x86:\ndeb [arch=i386] http...");
+	}
     while (curr) {
        llist_t *comp = curr->components;
        char *uri_part = uri_to_filename(curr->uri);
@@ -322,7 +353,7 @@ static void update_repos(repo_t *repos)
              uri_part, curr->dist, (char *)comp->data, arch);
           char *local_path = xasprintf("/var/lib/apt/lists/%s", local_name);
 
-          printf("%sGet:%d%s %s [%s]\n", CLR_GREEN, count++, CLR_RESET, url, (char *)comp->data);
+          printf("[%d] Get: %s [%s]\n", count++, url, (char *)comp->data);
 
           download_file(url, local_path);
 
@@ -405,29 +436,46 @@ static pkg_t *find_package(const char *name)
 
 typedef struct {
     char *name;
+	char *pkg_arch;
     long size;
 } pkg_info_t;
 
-static bool is_installed(const char *pkg_name)
+static pkg_info_t *get_pkg_info(const char *pkg_name)
 {
     llist_t *curr = G.installed_packages;
     while (curr) {
        pkg_info_t *info = (pkg_info_t *)curr->data;
-       if (strcmp(info->name, pkg_name) == 0) return true;
+       if (strcmp(info->name, pkg_name) == 0) return info;
        curr = curr->link;
     }
+    return NULL;
+}
+
+static bool is_installed(const char *pkg_name)
+{
+	pkg_info_t *info = get_pkg_info(pkg_name);
+	if (info != NULL) {
+		return true;
+	}
     return false;
 }
 
 static long get_installed_size(const char *pkg_name)
 {
-    llist_t *curr = G.installed_packages;
-    while (curr) {
-       pkg_info_t *info = (pkg_info_t *)curr->data;
-       if (strcmp(info->name, pkg_name) == 0) return info->size;
-       curr = curr->link;
+	pkg_info_t *info = get_pkg_info(pkg_name);
+	if (info != NULL) {
+		return info->size;
     }
     return 0;
+}
+
+static char *get_pkg_arch(const char *pkg_name)
+{
+	pkg_info_t *info = get_pkg_info(pkg_name);
+	if (info != NULL) {
+       return info->pkg_arch;
+    }
+    return NULL;
 }
 
 static void load_installed_packages(void)
@@ -435,6 +483,7 @@ static void load_installed_packages(void)
     FILE *f = fopen_for_read("/var/lib/dpkg/status");
     char *line;
     char *curr_pkg = NULL;
+	char *curr_arch = NULL;
     long curr_size = 0;
     bool installed = false;
 
@@ -443,8 +492,10 @@ static void load_installed_packages(void)
     while ((line = xmalloc_fgetline(f)) != NULL) {
        if (strncmp(line, "Package: ", 9) == 0) {
           curr_pkg = xstrdup(skip_whitespace(line + 9));
+	   } else if (strncmp(line, "Architecture: ", 14) == 0) {
+          curr_arch = xstrdup(skip_whitespace(line + 14));
        } else if (strncmp(line, "Status: ", 8) == 0) {
-          if (strstr(line, "installed")) installed = true;
+          if (strstr(line, "ok installed")) installed = true; //fix [purge ok not-installed]
        } else if (strncmp(line, "Installed-Size: ", 16) == 0) {
           curr_size = atol(skip_whitespace(line + 16));
        } else if (strncmp(line, "Provides: ", 10) == 0) {
@@ -470,12 +521,13 @@ static void load_installed_packages(void)
        } else if (*line == '\0') {
           if (installed && curr_pkg) {
              pkg_info_t *info = xzalloc(sizeof(pkg_info_t));
-             info->name = curr_pkg;
+             info->name = xstrdup(curr_pkg);
+			 info->pkg_arch = xstrdup(curr_arch);
              info->size = curr_size;
              llist_add_to(&G.installed_packages, info);
-             curr_pkg = NULL;
           }
           free(curr_pkg); curr_pkg = NULL;
+		  free(curr_arch); curr_arch = NULL;
           installed = false;
           curr_size = 0;
        }
@@ -484,12 +536,16 @@ static void load_installed_packages(void)
     /* Edge case: EOF without trailing newline */
     if (installed && curr_pkg) {
         pkg_info_t *info = xzalloc(sizeof(pkg_info_t));
-        info->name = curr_pkg;
+        info->name = xstrdup(curr_pkg);
+		info->pkg_arch = xstrdup(curr_arch);
         info->size = curr_size;
         llist_add_to(&G.installed_packages, info);
-    } else {
-        free(curr_pkg);
     }
+	if (curr_pkg != NULL) {
+		free(curr_pkg);
+		free(curr_arch);
+	}
+
     fclose(f);
 }
 
@@ -535,7 +591,10 @@ static void resolve_deps(pkg_t *p, bool force, int depth)
                 char *p_spec = strpbrk(clean_alt, " (:");
                 if (p_spec) *p_spec = '\0';
                 to_install = find_package(clean_alt);
-                if (to_install) break;
+                if (to_install) 
+					break;
+				else
+					printf("%s%s[ERROR]%s package: [%s] , missing dependency: [%s] not exist on repo! \n",CLR_RED ,CLR_BOLD, CLR_RESET,p->name,clean_alt);
                 alt = strtok_r(NULL, "|", &or_saveptr);
              }
              free(dep_entry_copy);
@@ -578,7 +637,10 @@ static void resolve_deps(pkg_t *p, bool force, int depth)
                 if (p_spec) *p_spec = '\0';
 
                 to_install = find_package(clean_alt);
-                if (to_install) break;
+                if (to_install) 
+					break;
+				else
+				   printf("%s%s[ERROR]%s package: [%s] , missing dependency: [%s] not exist on repo! \n",CLR_RED ,CLR_BOLD, CLR_RESET,p->name,clean_alt);
                 alt = strtok_r(NULL, "|", &or_saveptr);
              }
              free(dep_entry_copy);
@@ -660,33 +722,50 @@ static void load_all_packages(void)
     DIR *dir = opendir("/var/lib/apt/lists");
     struct dirent *entry;
 
-    if (!dir) return;
+    if (!dir) 
+		return;
+	if (repos == NULL) {
+		repos = parse_sources_list("/etc/apt/sources.list");
+	}
+	if (!repos) bb_error_msg_and_die("could not parse /etc/apt/sources.list");
 
     while ((entry = readdir(dir)) != NULL) {
        if (strstr(entry->d_name, "_Packages.gz")) {
           char *path = xasprintf("/var/lib/apt/lists/%s", entry->d_name);
           char *dists = strstr(entry->d_name, "_dists_");
-          int len, i;
-          char *uri, *repo_uri;
-
+          char *uri,*repo_uri = NULL;
+		  bool same_arch = true;
+		   
           if (!dists) {
              free(path); continue;
-          }
+          }         
+		  uri = xstrndup(entry->d_name, (dists - entry->d_name));
 
-          len = dists - entry->d_name;
-          uri = xstrndup(entry->d_name, len);
-          for (i = 0; uri[i]; i++) {
-             if (uri[i] == '_') uri[i] = '/';
-          }
-          repo_uri = xasprintf("http://%s", uri);
-
-          parse_package_file(path, repo_uri);
-
-          free(repo_uri);
+		  // check if Packages.gz name have different architecture on same repo to remove old not using..
+		  if (arch != NULL && strstr(entry->d_name, arch) == NULL) {
+			  same_arch = false;
+		  }
+		   
+          // check if this repo enabled and exist in /etc/apt/sources.list before load , and get url..
+		  for (repo_t *r = repos; r; r = r->next) {
+			if (same_arch && strcmp(uri , uri_to_filename(r->uri)) == 0) {
+				repo_uri = xstrdup(r->uri);
+				break;
+			}			
+		  }
+		   
+		  if(repo_uri != NULL) {
+			  parse_package_file(path, repo_uri);
+			  free(repo_uri);
+		  }
+		  else { // repo not exist in sources.list or disabled with #, syn apt folder and remove old files..
+		  	  remove_file(path,0); 
+		  } 		  
           free(uri);
           free(path);
        }
     }
+	free(repos);
     closedir(dir);
     
     /* Convert linked list to sorted array for performance */
@@ -784,7 +863,7 @@ static int count_upgradable(void)
        } else if (strncmp(line, "Version: ", 9) == 0) {
           curr_ver = xstrdup(skip_whitespace(line + 9));
        } else if (strncmp(line, "Status: ", 8) == 0) {
-          if (strstr(line, "installed")) installed = true;
+          if (strstr(line, "ok installed")) installed = true;
        } else if (*line == '\0') {
           if (installed && curr_pkg && curr_ver) {
              pkg_t *p = find_package(curr_pkg);
@@ -802,7 +881,7 @@ static int count_upgradable(void)
     return count;
 }
 
-int apt_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+
 static int check_deps_sanity(pkg_t *p)
 {
     int failed_count = 0;
@@ -852,9 +931,9 @@ static int check_files_sanity(const char *pkg_name)
     FILE *f = fopen(list_file, "r");
     char *line;
 
-    if (!f) {
+    if (!f && get_pkg_arch(pkg_name) != NULL) {
        free(list_file);
-       list_file = xasprintf("/var/lib/dpkg/info/%s:%s.list", pkg_name, get_debian_arch());
+       list_file = xasprintf("/var/lib/dpkg/info/%s:%s.list", pkg_name, get_pkg_arch(pkg_name));
        f = fopen(list_file, "r");
     }
 
@@ -883,6 +962,52 @@ static int check_files_sanity(const char *pkg_name)
     return failed_count;
 }
 
+static void clean(void)
+{
+	/* clean cache */
+	DIR *dir = opendir("/var/cache/apt/archives");
+	struct dirent *entry;
+
+	 if (dir != NULL) {
+		 while ((entry = readdir(dir)) != NULL) {
+				 if (strstr(entry->d_name, ".deb")) {
+					 char *path = xasprintf("/var/cache/apt/archives/%s", entry->d_name);
+					 remove_file(path,0);				 
+					 free(path);
+				 }
+		 }
+		 closedir(dir);
+	 }
+	
+}
+
+static void print_size_and_unit(unsigned long long size,bool is_byte)
+{
+	float bu = 1024.00f; //binary unit 1024 Byte = 1kB
+	/* size value in Byte */
+	if(is_byte) {
+		if (size < 1024) {
+			printf("%llu B", size);
+			return;
+		}
+		else
+			size = size / 1024; //to KB
+	}
+	/* size value in KB */
+	if (size < 1024) { 
+    	printf("%llu KB", size);// KB
+	}
+	else if (size < 1048576) { 
+		printf("%.2f MB", (float)size / bu);// MB
+	}
+	else if (size < 1073741824) { 
+		printf("%.2f GB", ((float)size / bu) / bu);//GB
+	}
+	else { 
+		printf("%.2f TB", (((float)size / bu) / bu) / bu);//TB
+	}	
+}
+
 static bool has_enough_disk_space(long required_kb)
 {
     struct statvfs st;
@@ -900,19 +1025,30 @@ static bool has_enough_disk_space(long required_kb)
        Multiply by fragment size to get bytes, then divide by 1024 for kB */
     free_kb = ((unsigned long long)st.f_bavail * st.f_frsize) / 1024;
 
+	/* if free less tan 200 MB auto clean cache every time call install,reinstall,rescue-install,upgrade */
+	if (free_kb < 204800) {
+		clean();
+		free_kb = ((unsigned long long)st.f_bavail * st.f_frsize) / 1024; //update value
+	}
+	
     /* Add a 50MB (51200 kB) safety buffer so we don't completely brick the OS */
-    safe_required_kb = (required_kb > 0 ? (unsigned long long)required_kb : 0) + 51200;
+    safe_required_kb = (required_kb > 0 ? (unsigned long long)required_kb : 0) + 51200; 
+	
 
-    printf("Storage protection: %llu kB available", free_kb);
-
+	printf("Storage protection: ");
+	print_size_and_unit(free_kb, false);
+	printf(" available");
+		
     if (free_kb < safe_required_kb) {
-        printf(" %s[FAILED]%s\n", CLR_RED, CLR_RESET);
-        printf("  %s[FATAL ERROR]%s Insufficient disk space!\n", CLR_RED, CLR_RESET);
-        printf("  Required: %llu kB (including 50MB safety buffer)\n", safe_required_kb);
+        printf(" %s%s[FAILED]%s\n", CLR_RED, CLR_BOLD, CLR_RESET);
+        printf("  %s%s[FATAL ERROR]%s Insufficient disk space!\n", CLR_RED, CLR_BOLD, CLR_RESET);
+        printf("  Required: ");
+		print_size_and_unit(safe_required_kb, false);
+		printf(" (including 50MB safety buffer)\n");
         return false;
     }
 
-    printf(" %s[PASSED]%s\n", CLR_GREEN, CLR_RESET);
+    printf(" %s%s[PASSED]%s\n", CLR_GREEN, CLR_BOLD, CLR_RESET);
     return true;
 }
 
@@ -920,14 +1056,48 @@ static bool is_valid_pkg_name(const char *name)
 {
     int i;
     for (i = 0; name[i]; i++) {
-        if (!isalnum(name[i]) && name[i] != '-' && name[i] != '+' && name[i] != '.')
+        if (!isalnum(name[i]) && name[i] != '-' && name[i] != '_' && name[i] != '+' && name[i] != '.')
             return false;
     }
     return true;
 }
 
-int apt_main(int argc, char **argv)
-{
+static void init_folders(void) {
+	//fix apt fault to install new packages if dpkg folders not exist in var for new systems.
+	FILE *fp;
+	struct stat s;
+	const char *arry_path[] = 
+	{
+		"/var/lib",
+		"/var/lib/apt",
+		"/var/lib/apt/lists",
+		"/var/lib/dpkg",
+		"/var/lib/dpkg/info",
+		"/var/cache",
+		"/var/cache/apt",
+		"/var/cache/apt/archives"
+	};
+
+	for (int i = 0; i < ARRAY_SIZE(arry_path); i++) {
+		if(0 == stat(arry_path[i], &s)) {
+			if(S_ISDIR(s.st_mode)) {
+				continue; //dir exist
+			} else
+				bb_error_msg_and_die("Error: make folder on (%s) , File exist on path!",arry_path[i]); //it file not dir
+		}		 		
+		mkdir(arry_path[i], 0755); //not exist
+	}
+	
+	/* check if system read only , apt can not do anything tell user , and make sure file status exist on new systems to avoid faults  */
+	fp = fopen("/var/lib/dpkg/status", "a");
+	if (fp != NULL)
+		fclose(fp);
+	else //system read only
+		bb_error_msg_and_die("Error (Write to /var/lib/dpkg/status): \n*System mounted in read only mode or permission denied!"); 
+}
+
+int apt_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+int apt_main(int argc, char **argv) {
     const char *cmd = NULL;
     bool force_depends = false;
     int i, new_argc = 0;
@@ -961,37 +1131,40 @@ int apt_main(int argc, char **argv)
     argc = new_argc;
 
     if (strcmp(cmd, "update") == 0) {
-       repo_t *repos, *r;
+       repo_t *r;
        int upgradable, hit_count = 1;
-
+	   
+	   init_folders();
+		
        repos = parse_sources_list("/etc/apt/sources.list");
        if (!repos) bb_error_msg_and_die("could not parse /etc/apt/sources.list");
 
        for (r = repos; r; r = r->next) {
-          printf("Hit:%d %s %s InRelease\n", hit_count++, r->uri, r->dist);
+          printf("[%d]. Hit: %s %s InRelease\n", hit_count++, r->uri, r->dist);
        }
-
+	   free(r);
+		
        printf("Reading package lists... Done\n");
-       update_repos(repos);
-
+	   update_repos();
        load_all_packages();
        upgradable = count_upgradable();
        printf("Building dependency tree... Done\n");
        printf("Reading state information... Done\n");
        if (upgradable > 0)
-          printf("%d packages can be upgraded. Run 'apt list --upgradable' to see them.\n", upgradable);
+          printf("%d packages can be upgraded. Run 'apt list -u' to see them.\n", upgradable);
 
     } else if (strcmp(cmd, "install") == 0 || strcmp(cmd, "reinstall") == 0 || strcmp(cmd, "rescue-install") == 0 || strcmp(cmd, "upgrade") == 0) {
        bool is_reinstall = (strcmp(cmd, "reinstall") == 0);
        bool is_rescue = (strcmp(cmd, "rescue-install") == 0);
        bool is_upgrade = (strcmp(cmd, "upgrade") == 0);
        llist_t *curr, *recommends_list = NULL;
-       int count = 0, total;
+       int count = 0, count2, total;
        long total_size = 0, total_installed_size = 0;
        unsigned w, h;
        char **dpkg_argv;
        int arg_idx;
 
+	   init_folders();
        printf("Reading package lists... Done\n");
        load_all_packages();
        load_installed_packages();
@@ -1009,7 +1182,7 @@ int apt_main(int argc, char **argv)
               while ((line = xmalloc_fgetline(f)) != NULL) {
                  if (strncmp(line, "Package: ", 9) == 0) curr_pkg = xstrdup(skip_whitespace(line + 9));
                  else if (strncmp(line, "Version: ", 9) == 0) curr_ver = xstrdup(skip_whitespace(line + 9));
-                 else if (strncmp(line, "Status: ", 8) == 0 && strstr(line, "installed")) installed = true;
+                 else if (strncmp(line, "Status: ", 8) == 0 && strstr(line, "ok installed")) installed = true;
                  else if (*line == '\0') {
                     if (installed && curr_pkg && curr_ver) {
                        pkg_t *p = find_package(curr_pkg);
@@ -1031,7 +1204,7 @@ int apt_main(int argc, char **argv)
        } else {
            for (i = 0; i < argc; i++) {
               pkg_t *p = find_package(argv[i]);
-              if (!p) { bb_error_msg("E: Unable to locate package %s", argv[i]); continue; }
+              if (!p) { bb_error_msg("%s%s[Error]:%s Unable to locate package %s", CLR_RED, CLR_BOLD,CLR_RESET,argv[i]); continue; }
               if (is_reinstall || is_rescue || !is_installed(argv[i])) resolve_deps(p, true, 0);
               else bb_info_msg("%s is already the newest version.", argv[i]);
            }
@@ -1065,27 +1238,41 @@ int apt_main(int argc, char **argv)
           llist_free(recommends_list, free);
        }
 
-       printf("The following %spackages will be %s:\n ", CLR_BOLD, is_upgrade ? "upgraded" : "installed", CLR_RESET);
+       printf("The following %spackages will be %s:%s\n", CLR_BOLD, is_upgrade ? "upgraded" : "installed", CLR_RESET);
        for (curr = G.install_queue; curr; curr = curr->link) {
           pkg_t *p = (pkg_t *)curr->data;
-          printf(" %s", p->name);
+		  char *tmp_deb = xasprintf("/var/cache/apt/archives%s", strrchr (p->filename, '/'));
           count++;
-          total_size += p->size;
-          total_installed_size += p->installed_size - get_installed_size(p->name);
+		  total_installed_size += (p->installed_size - get_installed_size(p->name));
+		  printf(" * Package: %s", p->name);
+          if (access(tmp_deb, F_OK) != 0) { //if package exist in cache skip count download size
+		   	total_size += p->size;
+		    printf(" , Download Size: ", p->name);
+		    print_size_and_unit(p->size, true); 
+		  }
+		  printf("\n");
+		   
+		  free(tmp_deb);
        }
-       
-       if (is_upgrade) printf("\n%d upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", count);
-       else printf("\n0 upgraded, %d newly installed, 0 to remove and 0 not upgraded.\n", count);
-
-       printf("Need to get %ld kB of archives.\n", total_size / 1024);
-       if (total_installed_size >= 0) printf("After this operation, %ld kB of additional disk space will be used.\n", total_installed_size);
-       else printf("After this operation, %ld kB disk space will be freed.\n", -total_installed_size);
-       
-       if (!has_enough_disk_space(total_installed_size > 0 ? (total_installed_size + (total_size / 1024)) : (total_size / 1024))) {
-           bb_error_msg_and_die("Installation aborted to protect filesystem integrity.");
+	   
+       printf("Need to get ");
+	   print_size_and_unit(total_size, true);
+	   printf(" of archives.\n", total_size);
+	   
+	   printf("After this operation, ");
+       if (total_installed_size >= 0) {
+		   print_size_and_unit(total_installed_size, false);
+		   printf(" of additional disk space will be used.\n");
+	   }else {
+		   print_size_and_unit(-total_installed_size, false);
+		   printf(" disk space will be freed.\n");
+	   }
+       if (total_size > 0)
+	   		total_size = total_size / 1024; //B to KB
+	   if (!has_enough_disk_space(total_installed_size > 0 ? (total_installed_size + total_size) : total_size )) {
+            bb_error_msg_and_die("Installation aborted to protect filesystem integrity.");
        }
-
-       printf("%sDo you want to continue? [Y/n]%s ", CLR_BOLD, CLR_RESET);
+       printf("\n%sDo you want to continue? [Y/n]%s ", CLR_BOLD, CLR_RESET);
        fflush(stdout);
 
        if (!bb_ask_y_confirmation()) return EXIT_SUCCESS;
@@ -1098,22 +1285,32 @@ int apt_main(int argc, char **argv)
        dpkg_argv = xmalloc(sizeof(char *) * (total + 5));
        arg_idx = 0;
        dpkg_argv[arg_idx++] = (char*)"dpkg"; /* Placed for alignment, dpkg_call rewrites index 0 */
-       dpkg_argv[arg_idx++] = (char*)"-i";
-       if (force_depends) dpkg_argv[arg_idx++] = (char*)"--force-depends";
+        if (force_depends) 
+			dpkg_argv[arg_idx++] = (char*)"--force-depends";
+		dpkg_argv[arg_idx++] = (char*)"-i";
 
-       count = 1;
+       count2 = 0;
        for (curr = G.install_queue; curr; curr = curr->link) {
           pkg_t *p = (pkg_t *)curr->data;
           char *url = xasprintf("%s/%s", p->repo_uri, p->filename);
-          char *tmp_deb = xasprintf("/tmp/%s.deb", p->name);
-
-          update_progress(count - 1, total, p->name);
+          char *tmp_deb = xasprintf("/var/cache/apt/archives%s", strrchr (p->filename, '/'));
+		  
+          update_progress(count2, total, p->name);
           printf("\033[%d;1H", h - 1);
-          printf("%sGet:%d%s %s %s %s [%s]\n", CLR_GREEN, count++, CLR_RESET, p->repo_uri, p->name, p->version, p->filename);
-
-          if (download_file(url, tmp_deb) == 0) {
+		  count2++;
+          printf("[%d].Get: %s , version: %s , size: ", count2 , p->name , p->version);
+		  print_size_and_unit(p->size, true); 
+		  printf("\n");
+		   
+          if (!access(tmp_deb, F_OK)) { //if package exist in cache
               dpkg_argv[arg_idx++] = tmp_deb;
           }
+		   else {
+			  printf("[%d].Get:%s\n", count2 , url); //show url
+			  if (download_file(url, tmp_deb) == 0)
+			  	dpkg_argv[arg_idx++] = tmp_deb;
+		  }
+		  
           free(url);
        }
        update_progress(total, total, "Done");
@@ -1124,8 +1321,8 @@ int apt_main(int argc, char **argv)
           bb_info_msg("Rescue Mode: Manually extracting packages...");
           for (curr = G.install_queue; curr; curr = curr->link) {
              pkg_t *p = (pkg_t *)curr->data;
-             char *tmp_deb = xasprintf("/tmp/%s.deb", p->name);
-             
+             char *tmp_deb = xasprintf("/var/cache/apt/archives%s", strrchr (p->filename, '/'));
+			  
              if (is_valid_pkg_name(p->name)) {
                 char *r_cmd;
                 printf("  Extracting %s...\n", p->name);
@@ -1133,80 +1330,93 @@ int apt_main(int argc, char **argv)
                 r_cmd = xasprintf("ar -p %s data.tar.xz 2>/dev/null | tar -C / -xJ 2>/dev/null || "
                                  "ar -p %s data.tar.gz 2>/dev/null | tar -C / -xz 2>/dev/null",
                                  tmp_deb, tmp_deb);
-                system(r_cmd);
+				 
+                if(system(r_cmd) != 0)
+					 bb_error_msg("Error in extracting file (%s)",tmp_deb);
                 free(r_cmd);
              } else {
                 bb_error_msg("Invalid package name syntax for %s, skipping rescue extraction", p->name);
              }
              free(tmp_deb);
           }
-       } else if (arg_idx > 3) { /* Ensure we actually downloaded something */
-          printf("\033[%d;1H", h - 1);
+       } else if (arg_idx > 2) { /* Ensure we actually downloaded something */ //fix if dpkg_argv not have --force-depends 
+		  printf("\033[%d;1H", h - 1);
           bb_info_msg("Configuring packages...");
-          dpkg_call(dpkg_argv);
-
-          /* Cleanup */
-          for (curr = G.install_queue; curr; curr = curr->link) {
-             pkg_t *p = (pkg_t *)curr->data;
-             char *tmp_deb = xasprintf("/tmp/%s.deb", p->name);
-             unlink(tmp_deb);
-             free(tmp_deb);
-          }
+		  bb_info_msg("install...");
+          if (dpkg_call(dpkg_argv) != 0) {			  
+			    printf("\033[r\033[%d;1H\n", h);
+       			free(dpkg_argv);
+			    bb_error_msg_and_die("Installation for one package or more aborted.. %s%s[FAILED]%s",CLR_RED, CLR_BOLD,CLR_RESET);
+		  }
+			  
        }
-       
+	   bb_info_msg("Done.");
+
+       if (is_upgrade) 
+		   printf("\n%d upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", count);
+       else 
+		   printf("\n0 upgraded, %d newly installed, 0 to remove and 0 not upgraded.\n", count);
+		
        printf("\033[r\033[%d;1H\n", h);
        free(dpkg_argv);
 
-    } else if (strcmp(cmd, "remove") == 0) {
+    } else if ((strcmp(cmd, "remove") == 0) || (strcmp(cmd, "purge") == 0)) {
        char **temp_argv;
-
+	   char *type;
+		
        if (argc == 0) bb_show_usage();
 
-       printf("The following packages will be REMOVED:\n ");
+       printf("The following %spackages will be REMOVED:%s\n",CLR_BOLD,CLR_RESET);
        temp_argv = argv;
-       while (*temp_argv) { printf(" %s", *temp_argv); temp_argv++; }
+       while (*temp_argv) { printf(" * Package: %s\n", *temp_argv); temp_argv++; }
        printf("\nDo you want to continue? [Y/n] ");
        fflush(stdout);
 
        if (!bb_ask_y_confirmation()) return EXIT_SUCCESS;
-
+	   
+	   type = xasprintf("--%s", cmd);
        while (*argv) {
-          char *dpkg_args_rm[] = {(char*)"dpkg", (char*)"-r", *argv, NULL};
+          char *dpkg_args_rm[] = {(char*)"dpkg", type, *argv, NULL};
           bb_info_msg("Removing %s...", *argv);
-          dpkg_call(dpkg_args_rm);
+          if (dpkg_call(dpkg_args_rm) != 0)
+			  bb_error_msg("Removing %s  %s%s[FAILED]%s", *argv,CLR_RED, CLR_BOLD,CLR_RESET);
           argv++;
        }
+	   free(type);
 
-    } else if (strcmp(cmd, "list") == 0) {
-       if (argc > 0 && strcmp(argv[0], "--upgradable") == 0) {
+    } else if (strcmp(cmd, "list") == 0) { 
           FILE *f;
           load_all_packages();
-          printf("Listing... Done\n");
+          printf("Listing installed..\n");
           f = fopen_for_read("/var/lib/dpkg/status");
           if (f) {
-             char *line, *curr_pkg = NULL, *curr_ver = NULL;
+             char *line, *curr_pkg = NULL, *curr_ver = NULL, *curr_arch = NULL;
              bool installed = false;
              while ((line = xmalloc_fgetline(f)) != NULL) {
+
                 if (strncmp(line, "Package: ", 9) == 0) curr_pkg = xstrdup(skip_whitespace(line + 9));
                 else if (strncmp(line, "Version: ", 9) == 0) curr_ver = xstrdup(skip_whitespace(line + 9));
-                else if (strncmp(line, "Status: ", 8) == 0 && strstr(line, "installed")) installed = true;
+				else if (strncmp(line, "Architecture: ", 14) == 0) curr_arch = xstrdup(skip_whitespace(line + 14));
+                else if (strncmp(line, "Status: ", 8) == 0 && strstr(line, "ok installed")) installed = true;
                 else if (*line == '\0') {
-                   if (installed && curr_pkg && curr_ver) {
-                      pkg_t *p = find_package(curr_pkg);
-                      if (p && compare_versions(p->version, curr_ver) > 0) {
-                         printf("%s/%s %s %s [upgradable from: %s]\n", p->name, "stable", p->version, get_debian_arch(), curr_ver);
-                      }
+                	if (installed && curr_pkg && curr_ver && curr_arch) {
+					  pkg_t *p = find_package(curr_pkg);
+					  if (p && compare_versions(p->version, curr_ver) > 0) {// upgradable
+						 printf("* %s %s %s    [upgradable to version: %s]\n", p->name, curr_ver, curr_arch, p->version);
+					  }
+					  else if (argc == 0) {// installed
+					     printf("* %s %s %s\n", curr_pkg, curr_ver, curr_arch);
+					  }
                    }
-                   free(curr_pkg); curr_pkg = NULL;
-                   free(curr_ver); curr_ver = NULL;
-                   installed = false;
+                   free(curr_pkg);curr_pkg = NULL;
+                   free(curr_ver);curr_ver = NULL;
+				   free(curr_arch);curr_arch = NULL;
+				   installed = false;
                 }
                 free(line);
-             }
+			}
              fclose(f);
-          }
-       } else {
-          printf("Use --upgradable to see packages that can be upgraded.\n");
+
        }
 
     } else if (strcmp(cmd, "search") == 0) {
@@ -1280,24 +1490,27 @@ int apt_main(int argc, char **argv)
                 total_failed = d_failed + f_failed;
              } else total_failed = 1;
           } else {
-             printf("  [WARN] Package metadata not found in cache.\n");
+             printf("  [ERROR] Package metadata not found in cache , try run [apt update].\n",CLR_RED, CLR_BOLD,CLR_RESET);
              total_failed = 1;
           }
 
-          printf("  [RESULT] Sanity check: %s%s%s\n\n", total_failed == 0 ? CLR_GREEN : CLR_RED, total_failed == 0 ? "PASSED" : "FAILED", CLR_RESET);
+          printf("  [RESULT] Sanity check: %s%s%s%s\n\n", total_failed == 0 ? CLR_GREEN : CLR_RED, CLR_BOLD, total_failed == 0 ? "[PASSED]" : "[FAILED]", CLR_RESET);
        }
 
     } else if (strcmp(cmd, "md5check") == 0) {
        if (argc == 0) bb_show_usage();
-       
+
        for (i = 0; i < argc; i++) {
           char *sums_file = xasprintf("/var/lib/dpkg/info/%s.md5sums", argv[i]);
           FILE *f = fopen(sums_file, "r");
-
+		  
           if (!f) {
-             free(sums_file);
-             sums_file = xasprintf("/var/lib/dpkg/info/%s:%s.md5sums", argv[i], get_debian_arch());
-             f = fopen(sums_file, "r");
+			 load_installed_packages();
+			 if(get_pkg_arch(argv[i]) != NULL) {
+				 free(sums_file);
+				 sums_file = xasprintf("/var/lib/dpkg/info/%s:%s.md5sums", argv[i], get_pkg_arch(argv[i]));
+				 f = fopen(sums_file, "r");
+			 }
           }
 
           if (!f) {
@@ -1323,13 +1536,19 @@ int apt_main(int argc, char **argv)
                 }
                 free(line);
              }
-             if (failed == 0) printf("%sVerification successful:%s all %d files match md5sums.\n", CLR_GREEN, CLR_RESET, checked);
-             else printf("%sVerification failed:%s %d of %d files are corrupted.\n", CLR_RED, CLR_RESET, failed, checked);
+             if (failed == 0) printf("All %d files match md5sums: %s%s[Verification successful]%s\n", checked, CLR_GREEN, CLR_BOLD, CLR_RESET);
+             else printf("%d of %d files are corrupted: %s%s[Verification failed]%s\n", failed, checked, CLR_RED, CLR_BOLD, CLR_RESET);
           }
           fclose(f);
           free(sums_file);
        }
-    } else bb_show_usage();
+    } else if (strcmp(cmd, "clean") == 0) {
+		
+			 bb_info_msg("Clean...");
+			 clean();
+			 bb_info_msg("Done.");
+	
+	} else bb_show_usage();
 
     return EXIT_SUCCESS;
 }
