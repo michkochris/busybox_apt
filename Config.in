@@ -5,6 +5,8 @@ config APT
    bool "apt (8 kb)"
    default y
    select DPKG
+   select AR
+   select TAR
    help
    apt is a high-level package management frontend. It handles
    repository management and dependency resolution as a
