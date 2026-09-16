@@ -201,27 +201,7 @@ static int md5_check(const char *md5, const char *path)
     return rc;
 }
 
-static void update_progress(int current, int total, const char *msg UNUSED_PARAM)
-{
-    unsigned width, height;
-    int i, pos, percent;
-    int bar_space;
 
-    get_terminal_width_height(STDOUT_FILENO, &width, &height);
-    if (width < 30) return;
-    percent = (current * 100) / total;
-    bar_space = width - 24;
-    if (bar_space < 10) bar_space = 10;
-    pos = (percent * bar_space) / 100;
-    printf("\033[%d;1H\033[K", height);
-    printf("Progress: [%3d%%] [", percent);
-    for (i = 0; i < bar_space; i++) {
-       if (i < pos) printf("#");
-       else printf(".");
-    }
-    printf("]");
-    fflush(stdout);
-}
 
 static int llist_count(llist_t *list)
 {
@@ -231,6 +211,23 @@ static int llist_count(llist_t *list)
        list = list->link;
     }
     return count;
+}
+
+static void print_apt_progress_inline(int current, int total, const char *pkg_name)
+{
+    unsigned width = 80;
+    get_terminal_width_height(STDOUT_FILENO, &width, NULL);
+    int percent = (total > 0) ? (current * 100) / total : 100;
+    int bar_width = 20;
+    int pos = (percent * bar_width) / 100;
+
+    printf("\r[%d]:progress::%3d%%::[", current, percent);
+    for (int i = 0; i < bar_width; i++) {
+        if (i < pos) printf("#");
+        else printf(".");
+    }
+    printf("]::%s", pkg_name);
+    fflush(stdout);
 }
 
 static char *get_debian_arch(void)
@@ -353,9 +350,11 @@ static void update_repos(void)
              uri_part, curr->dist, (char *)comp->data, arch);
           char *local_path = xasprintf("/var/lib/apt/lists/%s", local_name);
 
-          printf("[%d] Get: %s [%s]\n", count++, url, (char *)comp->data);
+          printf("[%d]:Get: %s [%s]\n", count++, url, (char *)comp->data);
 
-          download_file(url, local_path);
+          if (download_file(url, local_path) != 0) {
+              remove_file(local_path, 0);
+          }
 
           free(local_path);
           free(local_name);
@@ -656,14 +655,22 @@ static void resolve_deps(pkg_t *p, bool force, int depth)
 
 static void parse_package_file(const char *filename, const char *repo_uri)
 {
-    int fd = open_zipped(filename, 0);
+    struct stat st;
+    int fd;
     FILE *f;
     char *line;
     pkg_t *curr = NULL;
     char **last_field = NULL;
 
+    if (stat(filename, &st) != 0 || st.st_size == 0) return;
+
+    fd = open_zipped(filename, 0);
     if (fd < 0) return;
     f = fdopen(fd, "r");
+    if (!f) {
+        close(fd);
+        return;
+    }
 
     while ((line = xmalloc_fgetline(f)) != NULL) {
        if (*line == '\0') {
@@ -755,7 +762,12 @@ static void load_all_packages(void)
 		  }
 		   
 		  if(repo_uri != NULL) {
-			  parse_package_file(path, repo_uri);
+              struct stat st;
+              if (stat(path, &st) == 0 && st.st_size > 0) {
+			      parse_package_file(path, repo_uri);
+              } else {
+                  remove_file(path, 0);
+              }
 			  free(repo_uri);
 		  }
 		  else { // repo not exist in sources.list or disabled with #, syn apt folder and remove old files..
@@ -1140,7 +1152,7 @@ int apt_main(int argc, char **argv) {
        if (!repos) bb_error_msg_and_die("could not parse /etc/apt/sources.list");
 
        for (r = repos; r; r = r->next) {
-          printf("[%d]. Hit: %s %s InRelease\n", hit_count++, r->uri, r->dist);
+          printf("[%d]:Hit: %s %s InRelease\n", hit_count++, r->uri, r->dist);
        }
 	   free(r);
 		
@@ -1231,28 +1243,23 @@ int apt_main(int argc, char **argv) {
           }
        }
 
-       if (recommends_list) {
-          printf("Note: Recommended packages are NOT installed by default.\nRecommended packages:\n ");
-          for (curr = recommends_list; curr; curr = curr->link) printf(" %s", (char *)curr->data);
-          printf("\n");
-          llist_free(recommends_list, free);
-       }
-
        printf("The following %spackages will be %s:%s\n", CLR_BOLD, is_upgrade ? "upgraded" : "installed", CLR_RESET);
-       for (curr = G.install_queue; curr; curr = curr->link) {
-          pkg_t *p = (pkg_t *)curr->data;
-		  char *tmp_deb = xasprintf("/var/cache/apt/archives%s", strrchr (p->filename, '/'));
-          count++;
-		  total_installed_size += (p->installed_size - get_installed_size(p->name));
-		  printf(" * Package: %s", p->name);
-          if (access(tmp_deb, F_OK) != 0) { //if package exist in cache skip count download size
-		   	total_size += p->size;
-		    printf(" , Download Size: ", p->name);
-		    print_size_and_unit(p->size, true); 
-		  }
-		  printf("\n");
-		   
-		  free(tmp_deb);
+       {
+          int pkg_idx = 1;
+          for (curr = G.install_queue; curr; curr = curr->link) {
+             pkg_t *p = (pkg_t *)curr->data;
+		     char *tmp_deb = xasprintf("/var/cache/apt/archives%s", strrchr (p->filename, '/'));
+             count++;
+		     total_installed_size += (p->installed_size - get_installed_size(p->name));
+		     printf("[%d]:%s-%s", pkg_idx++, p->name, p->version);
+             if (access(tmp_deb, F_OK) != 0) { //if package exist in cache skip count download size
+		   	    total_size += p->size;
+		        printf("::download size::");
+		        print_size_and_unit(p->size, true);
+		     }
+		     printf("\n");
+		     free(tmp_deb);
+          }
        }
 	   
        printf("Need to get ");
@@ -1272,14 +1279,21 @@ int apt_main(int argc, char **argv) {
 	   if (!has_enough_disk_space(total_installed_size > 0 ? (total_installed_size + total_size) : total_size )) {
             bb_error_msg_and_die("Installation aborted to protect filesystem integrity.");
        }
+
+       if (recommends_list) {
+          printf("\nrecommended packages:");
+          for (curr = recommends_list; curr; curr = curr->link) {
+             printf(" %s", (char *)curr->data);
+          }
+          printf("\n");
+          llist_free(recommends_list, free);
+       }
        printf("\n%sDo you want to continue? [Y/n]%s ", CLR_BOLD, CLR_RESET);
        fflush(stdout);
 
        if (!bb_ask_y_confirmation()) return EXIT_SUCCESS;
 
        total = llist_count(G.install_queue);
-       get_terminal_width_height(STDOUT_FILENO, &w, &h);
-       printf("\033[1;%dr", h - 1);
 
        /* Prepare dynamic arguments array for dpkg to avoid fragmentation */
        dpkg_argv = xmalloc(sizeof(char *) * (total + 5));
@@ -1295,29 +1309,34 @@ int apt_main(int argc, char **argv) {
           char *url = xasprintf("%s/%s", p->repo_uri, p->filename);
           char *tmp_deb = xasprintf("/var/cache/apt/archives%s", strrchr (p->filename, '/'));
 		  
-          update_progress(count2, total, p->name);
-          printf("\033[%d;1H", h - 1);
 		  count2++;
-          printf("[%d].Get: %s , version: %s , size: ", count2 , p->name , p->version);
-		  print_size_and_unit(p->size, true); 
-		  printf("\n");
-		   
+          print_apt_progress_inline(count2, total, p->name);
+
           if (!access(tmp_deb, F_OK)) { //if package exist in cache
+              printf("\r\033[K");
+              printf("[%d]:Get:%s::version::%s::size::", count2 , p->name , p->version);
+              print_size_and_unit(p->size, true);
+              printf("::[cached]\n");
               dpkg_argv[arg_idx++] = tmp_deb;
           }
 		   else {
-			  printf("[%d].Get:%s\n", count2 , url); //show url
-			  if (download_file(url, tmp_deb) == 0)
-			  	dpkg_argv[arg_idx++] = tmp_deb;
+			  if (download_file(url, tmp_deb) == 0) {
+                  printf("\r\033[K");
+                  printf("[%d]:Get:%s::version::%s::size::", count2 , p->name , p->version);
+                  print_size_and_unit(p->size, true);
+                  printf("\n");
+                  printf("[%d]:Get:%s\n", count2 , url);
+                  dpkg_argv[arg_idx++] = tmp_deb;
+              } else {
+                  printf("\n");
+              }
 		  }
 		  
           free(url);
        }
-       update_progress(total, total, "Done");
        dpkg_argv[arg_idx] = NULL; /* Null-terminate array for execvp */
 
        if (is_rescue) {
-          printf("\033[%d;1H", h - 1);
           bb_info_msg("Rescue Mode: Manually extracting packages...");
           for (curr = G.install_queue; curr; curr = curr->link) {
              pkg_t *p = (pkg_t *)curr->data;
@@ -1340,24 +1359,22 @@ int apt_main(int argc, char **argv) {
              free(tmp_deb);
           }
        } else if (arg_idx > 2) { /* Ensure we actually downloaded something */ //fix if dpkg_argv not have --force-depends 
-		  printf("\033[%d;1H", h - 1);
           bb_info_msg("Configuring packages...");
 		  bb_info_msg("install...");
           if (dpkg_call(dpkg_argv) != 0) {			  
-			    printf("\033[r\033[%d;1H\n", h);
        			free(dpkg_argv);
 			    bb_error_msg_and_die("Installation for one package or more aborted.. %s%s[FAILED]%s",CLR_RED, CLR_BOLD,CLR_RESET);
 		  }
 			  
        }
 	   bb_info_msg("Done.");
+       clean();
 
        if (is_upgrade) 
 		   printf("\n%d upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", count);
        else 
 		   printf("\n0 upgraded, %d newly installed, 0 to remove and 0 not upgraded.\n", count);
 		
-       printf("\033[r\033[%d;1H\n", h);
        free(dpkg_argv);
 
     } else if ((strcmp(cmd, "remove") == 0) || (strcmp(cmd, "purge") == 0)) {
